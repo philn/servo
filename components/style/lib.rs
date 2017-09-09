@@ -40,7 +40,7 @@
 extern crate app_units;
 extern crate arrayvec;
 extern crate atomic_refcell;
-extern crate bit_vec;
+extern crate smallbitvec;
 #[macro_use]
 extern crate bitflags;
 #[allow(unused_extern_crates)] extern crate byteorder;
