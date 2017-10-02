@@ -6,16 +6,15 @@
 #![feature(box_syntax)]
 #![feature(conservative_impl_trait)]
 #![feature(const_fn)]
+#![feature(const_ptr_null)]
+#![feature(const_ptr_null_mut)]
 #![feature(core_intrinsics)]
 #![feature(mpsc_select)]
 #![feature(nonzero)]
 #![feature(on_unimplemented)]
 #![feature(plugin)]
 #![feature(proc_macro)]
-#![feature(stmt_expr_attributes)]
 #![feature(try_from)]
-#![feature(unboxed_closures)]
-#![feature(untagged_unions)]
 
 #![deny(unsafe_code)]
 #![allow(non_snake_case)]
@@ -26,7 +25,6 @@
 
 extern crate angle;
 extern crate app_units;
-extern crate audio_video_metadata;
 extern crate base64;
 #[macro_use]
 extern crate bitflags;
@@ -68,6 +66,7 @@ extern crate metrics;
 #[macro_use]
 extern crate mime;
 extern crate mime_guess;
+extern crate mitochondria;
 extern crate msg;
 extern crate net_traits;
 extern crate num_traits;
@@ -75,6 +74,7 @@ extern crate offscreen_gl_context;
 extern crate open;
 extern crate parking_lot;
 extern crate phf;
+extern crate playground;
 #[macro_use]
 extern crate profile_traits;
 extern crate ref_filter_map;
@@ -84,6 +84,7 @@ extern crate script_layout_interface;
 extern crate script_traits;
 extern crate selectors;
 extern crate serde;
+extern crate serde_json;
 extern crate servo_arc;
 #[macro_use] extern crate servo_atoms;
 extern crate servo_config;
@@ -105,6 +106,9 @@ extern crate uuid;
 extern crate webrender_api;
 extern crate webvr_traits;
 extern crate xml5ever;
+
+#[macro_use]
+mod task;
 
 mod body;
 pub mod clipboard_provider;
@@ -138,7 +142,7 @@ mod webdriver_handlers;
 pub mod layout_exports {
     pub use dom::bindings::inheritance::{CharacterDataTypeId, ElementTypeId};
     pub use dom::bindings::inheritance::{HTMLElementTypeId, NodeTypeId};
-    pub use dom::bindings::js::LayoutJS;
+    pub use dom::bindings::root::LayoutDom;
     pub use dom::characterdata::LayoutCharacterDataHelpers;
     pub use dom::document::{Document, LayoutDocumentHelpers, PendingRestyle};
     pub use dom::element::{Element, LayoutElementHelpers, RawLayoutElementHelpers};

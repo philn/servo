@@ -11,7 +11,6 @@ use parser::{ParserContext, ParserErrorContext};
 use properties::{Importance, PropertyDeclaration, PropertyDeclarationBlock, PropertyId, PropertyParserContext};
 use properties::{PropertyDeclarationId, LonghandId, SourcePropertyDeclaration};
 use properties::LonghandIdSet;
-use properties::animated_properties::AnimatableLonghand;
 use properties::longhands::transition_timing_function::single_value::SpecifiedValue as SpecifiedTimingFunction;
 use selectors::parser::SelectorParseError;
 use servo_arc::Arc;
@@ -19,8 +18,8 @@ use shared_lock::{DeepCloneParams, DeepCloneWithLock, SharedRwLock, SharedRwLock
 use std::fmt;
 use style_traits::{PARSING_MODE_DEFAULT, ToCss, ParseError, StyleParseError};
 use style_traits::PropertyDeclarationParseError;
-use stylesheets::{CssRuleType, MallocSizeOfFn, MallocSizeOfVec, StylesheetContents};
-use stylesheets::rule_parser::{VendorPrefix, get_location_with_offset};
+use stylesheets::{CssRuleType, StylesheetContents};
+use stylesheets::rule_parser::VendorPrefix;
 use values::{KeyframesName, serialize_percentage};
 
 /// A [`@keyframes`][keyframes] rule.
@@ -100,6 +99,7 @@ impl DeepCloneWithLock for KeyframesRule {
 /// A number from 0 to 1, indicating the percentage of the animation when this
 /// keyframe should run.
 #[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
+#[cfg_attr(feature = "gecko", derive(MallocSizeOf))]
 #[cfg_attr(feature = "servo", derive(HeapSizeOf))]
 pub struct KeyframePercentage(pub f32);
 
@@ -263,11 +263,14 @@ impl DeepCloneWithLock for Keyframe {
 ///
 /// TODO: Find a better name for this?
 #[derive(Debug)]
+#[cfg_attr(feature = "gecko", derive(MallocSizeOf))]
 #[cfg_attr(feature = "servo", derive(HeapSizeOf))]
 pub enum KeyframesStepValue {
     /// A step formed by a declaration block specified by the CSS.
     Declarations {
         /// The declaration block per se.
+        #[cfg_attr(feature = "gecko",
+                   ignore_malloc_size_of = "XXX: Primary ref, measure if DMD says it's worthwhile")]
         #[cfg_attr(feature = "servo", ignore_heap_size_of = "Arc")]
         block: Arc<Locked<PropertyDeclarationBlock>>
     },
@@ -278,6 +281,7 @@ pub enum KeyframesStepValue {
 
 /// A single step from a keyframe animation.
 #[derive(Debug)]
+#[cfg_attr(feature = "gecko", derive(MallocSizeOf))]
 #[cfg_attr(feature = "servo", derive(HeapSizeOf))]
 pub struct KeyframesStep {
     /// The percentage of the animation duration when this step starts.
@@ -299,7 +303,7 @@ impl KeyframesStep {
            guard: &SharedRwLockReadGuard) -> Self {
         let declared_timing_function = match value {
             KeyframesStepValue::Declarations { ref block } => {
-                block.read_with(guard).declarations().iter().any(|&(ref prop_decl, _)| {
+                block.read_with(guard).declarations().iter().any(|prop_decl| {
                     match *prop_decl {
                         PropertyDeclaration::AnimationTimingFunction(..) => true,
                         _ => false,
@@ -325,7 +329,7 @@ impl KeyframesStep {
         match self.value {
             KeyframesStepValue::Declarations { ref block } => {
                 let guard = block.read_with(guard);
-                let &(ref declaration, _) =
+                let (declaration, _) =
                     guard.get(PropertyDeclarationId::Longhand(LonghandId::AnimationTimingFunction)).unwrap();
                 match *declaration {
                     PropertyDeclaration::AnimationTimingFunction(ref value) => {
@@ -349,38 +353,49 @@ impl KeyframesStep {
 ///
 /// It only takes into account animable properties.
 #[derive(Debug)]
+#[cfg_attr(feature = "gecko", derive(MallocSizeOf))]
 #[cfg_attr(feature = "servo", derive(HeapSizeOf))]
 pub struct KeyframesAnimation {
     /// The difference steps of the animation.
     pub steps: Vec<KeyframesStep>,
     /// The properties that change in this animation.
-    pub properties_changed: Vec<AnimatableLonghand>,
+    pub properties_changed: LonghandIdSet,
     /// Vendor prefix type the @keyframes has.
     pub vendor_prefix: Option<VendorPrefix>,
 }
 
 /// Get all the animated properties in a keyframes animation.
-fn get_animated_properties(keyframes: &[Arc<Locked<Keyframe>>], guard: &SharedRwLockReadGuard)
-                           -> Vec<AnimatableLonghand> {
-    let mut ret = vec![];
-    let mut seen = LonghandIdSet::new();
+fn get_animated_properties(
+    keyframes: &[Arc<Locked<Keyframe>>],
+    guard: &SharedRwLockReadGuard
+) -> LonghandIdSet {
+    let mut ret = LonghandIdSet::new();
     // NB: declarations are already deduplicated, so we don't have to check for
     // it here.
     for keyframe in keyframes {
         let keyframe = keyframe.read_with(&guard);
         let block = keyframe.block.read_with(guard);
-        for &(ref declaration, importance) in block.declarations().iter() {
-            assert!(!importance.important());
+        // CSS Animations spec clearly defines that properties with !important
+        // in keyframe rules are invalid and ignored, but it's still ambiguous
+        // whether we should drop the !important properties or retain the
+        // properties when they are set via CSSOM. So we assume there might
+        // be properties with !important in keyframe rules here.
+        // See the spec issue https://github.com/w3c/csswg-drafts/issues/1824
+        for declaration in block.normal_declaration_iter() {
+            let longhand_id = match declaration.id() {
+                PropertyDeclarationId::Longhand(id) => id,
+                _ => continue,
+            };
 
-            if let Some(property) = AnimatableLonghand::from_declaration(declaration) {
-                // Skip the 'display' property because although it is animatable from SMIL,
-                // it should not be animatable from CSS Animations or Web Animations.
-                if property != AnimatableLonghand::Display &&
-                   !seen.has_animatable_longhand_bit(&property) {
-                    seen.set_animatable_longhand_bit(&property);
-                    ret.push(property);
-                }
+            if longhand_id == LonghandId::Display {
+                continue;
             }
+
+            if !longhand_id.is_animatable() {
+                continue;
+            }
+
+            ret.insert(longhand_id);
         }
     }
 
@@ -396,14 +411,15 @@ impl KeyframesAnimation {
     ///
     /// Otherwise, this will compute and sort the steps used for the animation,
     /// and return the animation object.
-    pub fn from_keyframes(keyframes: &[Arc<Locked<Keyframe>>],
-                          vendor_prefix: Option<VendorPrefix>,
-                          guard: &SharedRwLockReadGuard)
-                          -> Self {
+    pub fn from_keyframes(
+        keyframes: &[Arc<Locked<Keyframe>>],
+        vendor_prefix: Option<VendorPrefix>,
+        guard: &SharedRwLockReadGuard,
+    ) -> Self {
         let mut result = KeyframesAnimation {
             steps: vec![],
-            properties_changed: vec![],
-            vendor_prefix: vendor_prefix,
+            properties_changed: LonghandIdSet::new(),
+            vendor_prefix,
         };
 
         if keyframes.is_empty() {
@@ -441,14 +457,6 @@ impl KeyframesAnimation {
         }
 
         result
-    }
-
-    /// Measure heap usage.
-    pub fn malloc_size_of_children(&self, malloc_size_of: MallocSizeOfFn) -> usize {
-        let mut n = 0;
-        n += self.steps.malloc_shallow_size_of_vec(malloc_size_of);
-        n += self.properties_changed.malloc_shallow_size_of_vec(malloc_size_of);
-        n
     }
 }
 
@@ -509,12 +517,11 @@ impl<'a, 'i, R: ParseErrorReporter> QualifiedRuleParser<'i> for KeyframeListPars
     fn parse_prelude<'t>(&mut self, input: &mut Parser<'i, 't>) -> Result<Self::Prelude, ParseError<'i>> {
         let start_position = input.position();
         let start_location = input.current_source_location();
-        let location = get_location_with_offset(start_location);
         match KeyframeSelector::parse(input) {
             Ok(sel) => {
                 Ok(KeyframeSelectorParserPrelude {
                     selector: sel,
-                    source_location: location,
+                    source_location: start_location,
                 })
             },
             Err(e) => {
@@ -583,8 +590,8 @@ impl<'a, 'b, 'i> DeclarationParser<'i> for KeyframeDeclarationParser<'a, 'b> {
         let property_context = PropertyParserContext::new(self.context);
 
         let id = PropertyId::parse(&name, Some(&property_context))
-            .map_err(|()| PropertyDeclarationParseError::UnknownProperty(name))?;
-        match PropertyDeclaration::parse_into(self.declarations, id, self.context, input) {
+            .map_err(|()| PropertyDeclarationParseError::UnknownProperty(name.clone()))?;
+        match PropertyDeclaration::parse_into(self.declarations, id, name, self.context, input) {
             Ok(()) => {
                 // In case there is still unparsed text in the declaration, we should roll back.
                 input.expect_exhausted().map_err(|e| e.into())

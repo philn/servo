@@ -2,75 +2,124 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
-use audio_video_metadata;
-use document_loader::LoadType;
+use document_loader::{LoadBlocker, LoadType};
 use dom::attr::Attr;
-use dom::bindings::cell::DOMRefCell;
+use dom::bindings::cell::DomRefCell;
 use dom::bindings::codegen::Bindings::AttrBinding::AttrMethods;
 use dom::bindings::codegen::Bindings::HTMLMediaElementBinding::CanPlayTypeResult;
-use dom::bindings::codegen::Bindings::HTMLMediaElementBinding::HTMLMediaElementConstants::*;
+use dom::bindings::codegen::Bindings::HTMLMediaElementBinding::HTMLMediaElementConstants;
 use dom::bindings::codegen::Bindings::HTMLMediaElementBinding::HTMLMediaElementMethods;
 use dom::bindings::codegen::Bindings::MediaErrorBinding::MediaErrorConstants::*;
 use dom::bindings::codegen::Bindings::MediaErrorBinding::MediaErrorMethods;
+use dom::bindings::codegen::InheritTypes::{ElementTypeId, HTMLElementTypeId};
+use dom::bindings::codegen::InheritTypes::{HTMLMediaElementTypeId, NodeTypeId};
+use dom::bindings::error::{Error, ErrorResult};
 use dom::bindings::inheritance::Castable;
-use dom::bindings::js::{MutNullableJS, Root};
 use dom::bindings::refcounted::Trusted;
 use dom::bindings::reflector::DomObject;
+use dom::bindings::root::{DomRoot, MutNullableDom};
 use dom::bindings::str::DOMString;
 use dom::document::Document;
 use dom::element::{Element, AttributeMutation};
 use dom::eventtarget::EventTarget;
-use dom::htmlaudioelement::HTMLAudioElement;
 use dom::htmlelement::HTMLElement;
 use dom::htmlsourceelement::HTMLSourceElement;
-use dom::htmlvideoelement::HTMLVideoElement;
 use dom::mediaerror::MediaError;
 use dom::node::{window_from_node, document_from_node, Node, UnbindContext};
+use dom::promise::Promise;
 use dom::virtualmethods::VirtualMethods;
 use dom_struct::dom_struct;
 use html5ever::{LocalName, Prefix};
 use ipc_channel::ipc;
 use ipc_channel::router::ROUTER;
 use microtask::{Microtask, MicrotaskRunnable};
+use mime::{Mime, SubLevel, TopLevel};
 use net_traits::{FetchResponseListener, FetchMetadata, Metadata, NetworkError};
 use net_traits::request::{CredentialsMode, Destination, RequestInit, Type as RequestType};
 use network_listener::{NetworkListener, PreInvoke};
-use script_thread::{Runnable, ScriptThread};
+use script_thread::ScriptThread;
 use servo_url::ServoUrl;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
+use std::mem;
+use std::rc::Rc;
+use playground::{self, player};
 use std::sync::{Arc, Mutex};
 use task_source::TaskSource;
 use time::{self, Timespec, Duration};
+use dom::bindings::trace::JSTraceable;
+use js::jsapi::JSTracer;
+use serde_json;
+
+// TODO(philn): this doesn't belong here.
+#[allow(unsafe_code)]
+unsafe impl JSTraceable for RefCell<playground::player::Player> {
+    unsafe fn trace(&self, trc: *mut JSTracer) {
+    }
+}
 
 #[dom_struct]
+// FIXME(nox): A lot of tasks queued for this element should probably be in the
+// media element event task source.
 pub struct HTMLMediaElement {
     htmlelement: HTMLElement,
-    /// https://html.spec.whatwg.org/multipage/#dom-media-networkstate-2
-    // FIXME(nox): Use an enum.
-    network_state: Cell<u16>,
-    /// https://html.spec.whatwg.org/multipage/#dom-media-readystate-2
-    // FIXME(nox): Use an enum.
-    ready_state: Cell<u16>,
-    /// https://html.spec.whatwg.org/multipage/#dom-media-currentsrc-2
-    current_src: DOMRefCell<String>,
-    // FIXME(nox): Document this one, I have no idea what it is used for.
+    /// https://html.spec.whatwg.org/multipage/#dom-media-networkstate
+    network_state: Cell<NetworkState>,
+    /// https://html.spec.whatwg.org/multipage/#dom-media-readystate
+    ready_state: Cell<ReadyState>,
+    /// https://html.spec.whatwg.org/multipage/#dom-media-currentsrc
+    current_src: DomRefCell<String>,
+    /// Incremented whenever tasks associated with this element are cancelled.
     generation_id: Cell<u32>,
     /// https://html.spec.whatwg.org/multipage/#fire-loadeddata
     ///
     /// Reset to false every time the load algorithm is invoked.
     fired_loadeddata_event: Cell<bool>,
-    /// https://html.spec.whatwg.org/multipage/#dom-media-error-2
-    error: MutNullableJS<MediaError>,
-    /// https://html.spec.whatwg.org/multipage/#dom-media-paused-2
+    /// https://html.spec.whatwg.org/multipage/#dom-media-error
+    error: MutNullableDom<MediaError>,
+    /// https://html.spec.whatwg.org/multipage/#dom-media-paused
     paused: Cell<bool>,
     /// https://html.spec.whatwg.org/multipage/#attr-media-autoplay
     autoplaying: Cell<bool>,
+    /// https://html.spec.whatwg.org/multipage/#delaying-the-load-event-flag
+    delaying_the_load_event_flag: DomRefCell<Option<LoadBlocker>>,
+    /// https://html.spec.whatwg.org/multipage/#list-of-pending-play-promises
+    #[ignore_heap_size_of = "promises are hard"]
+    pending_play_promises: DomRefCell<Vec<Rc<Promise>>>,
+    /// Play promises which are soon to be fulfilled by a queued task.
+    #[ignore_heap_size_of = "promises are hard"]
+    in_flight_play_promises_queue: DomRefCell<VecDeque<(Box<[Rc<Promise>]>, ErrorResult)>>,
     /// The details of the video currently related to this media element.
     // FIXME(nox): Why isn't this in HTMLVideoElement?
-    video: DOMRefCell<Option<VideoMedia>>,
+    video: DomRefCell<Option<VideoMedia>>,
+    /// Whether the media metadata has been completely received.
+    have_metadata: Cell<bool>,
+    #[ignore_heap_size_of = "oops"]
+    player: RefCell<player::Player>,
 }
 
-#[derive(HeapSizeOf, JSTraceable)]
+/// https://html.spec.whatwg.org/multipage/#dom-media-networkstate
+#[derive(Clone, Copy, HeapSizeOf, JSTraceable, PartialEq)]
+#[repr(u8)]
+pub enum NetworkState {
+    Empty = HTMLMediaElementConstants::NETWORK_EMPTY as u8,
+    Idle = HTMLMediaElementConstants::NETWORK_IDLE as u8,
+    Loading = HTMLMediaElementConstants::NETWORK_LOADING as u8,
+    NoSource = HTMLMediaElementConstants::NETWORK_NO_SOURCE as u8,
+}
+
+/// https://html.spec.whatwg.org/multipage/#dom-media-readystate
+#[derive(Clone, Copy, HeapSizeOf, JSTraceable, PartialEq, PartialOrd)]
+#[repr(u8)]
+enum ReadyState {
+    HaveNothing = HTMLMediaElementConstants::HAVE_NOTHING as u8,
+    HaveMetadata = HTMLMediaElementConstants::HAVE_METADATA as u8,
+    HaveCurrentData = HTMLMediaElementConstants::HAVE_CURRENT_DATA as u8,
+    HaveFutureData = HTMLMediaElementConstants::HAVE_FUTURE_DATA as u8,
+    HaveEnoughData = HTMLMediaElementConstants::HAVE_ENOUGH_DATA as u8,
+}
+
+#[derive(HeapSizeOf, JSTraceable, Debug)]
 pub struct VideoMedia {
     format: String,
     #[ignore_heap_size_of = "defined in time"]
@@ -87,21 +136,202 @@ impl HTMLMediaElement {
         prefix: Option<Prefix>,
         document: &Document,
     ) -> Self {
+        playground::initialize();
         Self {
             htmlelement: HTMLElement::new_inherited(tag_name, prefix, document),
-            network_state: Cell::new(NETWORK_EMPTY),
-            ready_state: Cell::new(HAVE_NOTHING),
-            current_src: DOMRefCell::new("".to_owned()),
+            network_state: Cell::new(NetworkState::Empty),
+            ready_state: Cell::new(ReadyState::HaveNothing),
+            current_src: DomRefCell::new("".to_owned()),
             generation_id: Cell::new(0),
             fired_loadeddata_event: Cell::new(false),
             error: Default::default(),
             paused: Cell::new(true),
             // FIXME(nox): Why is this initialised to true?
             autoplaying: Cell::new(true),
-            video: DOMRefCell::new(None),
+            delaying_the_load_event_flag: Default::default(),
+            pending_play_promises: Default::default(),
+            in_flight_play_promises_queue: Default::default(),
+            video: DomRefCell::new(None),
+            have_metadata: Cell::new(false),
+            player: RefCell::new(player::Player::new()),
         }
     }
 
+    fn media_type_id(&self) -> HTMLMediaElementTypeId {
+        match self.upcast::<Node>().type_id() {
+            NodeTypeId::Element(ElementTypeId::HTMLElement(
+                HTMLElementTypeId::HTMLMediaElement(media_type_id),
+            )) => {
+                media_type_id
+            },
+            _ => unreachable!(),
+        }
+    }
+
+    /// Marks that element as delaying the load event or not.
+    ///
+    /// Nothing happens if the element was already delaying the load event and
+    /// we pass true to that method again.
+    ///
+    /// https://html.spec.whatwg.org/multipage/#delaying-the-load-event-flag
+    fn delay_load_event(&self, delay: bool) {
+        let mut blocker = self.delaying_the_load_event_flag.borrow_mut();
+        if delay && blocker.is_none() {
+            *blocker = Some(LoadBlocker::new(&document_from_node(self), LoadType::Media));
+        } else if !delay && blocker.is_some() {
+            LoadBlocker::terminate(&mut *blocker);
+        }
+    }
+
+    /// https://html.spec.whatwg.org/multipage/#dom-media-play
+    // FIXME(nox): Move this back to HTMLMediaElementMethods::Play once
+    // Rc<Promise> doesn't require #[allow(unrooted_must_root)] anymore.
+    fn play(&self, promise: &Rc<Promise>) {
+        // Step 1.
+        // FIXME(nox): Reject promise if not allowed to play.
+
+        // Step 2.
+        if self.error.get().map_or(false, |e| e.Code() == MEDIA_ERR_SRC_NOT_SUPPORTED) {
+            promise.reject_error(Error::NotSupported);
+            return;
+        }
+
+        // Step 3.
+        self.push_pending_play_promise(promise);
+
+        // Step 4.
+        if self.network_state.get() == NetworkState::Empty {
+            self.invoke_resource_selection_algorithm();
+        }
+
+        // Step 5.
+        // FIXME(nox): Seek to earliest possible position if playback has ended
+        // and direction of playback is forwards.
+
+        let state = self.ready_state.get();
+
+        let window = window_from_node(self);
+        let task_source = window.dom_manipulation_task_source();
+        if self.Paused() {
+            // Step 6.1.
+            self.paused.set(false);
+
+            // Step 6.2.
+            // FIXME(nox): Set show poster flag to false and run time marches on
+            // steps if show poster flag is true.
+
+            // Step 6.3.
+            task_source.queue_simple_event(self.upcast(), atom!("play"), &window);
+
+            // Step 6.4.
+            match state {
+                ReadyState::HaveNothing |
+                ReadyState::HaveMetadata |
+                ReadyState::HaveCurrentData => {
+                    task_source.queue_simple_event(
+                        self.upcast(),
+                        atom!("waiting"),
+                        &window,
+                    );
+                },
+                ReadyState::HaveFutureData |
+                ReadyState::HaveEnoughData => {
+                    self.notify_about_playing();
+                }
+            }
+        } else if state == ReadyState::HaveFutureData || state == ReadyState::HaveEnoughData {
+            // Step 7.
+            self.take_pending_play_promises(Ok(()));
+            let this = Trusted::new(self);
+            let generation_id = self.generation_id.get();
+            task_source.queue(
+                task!(resolve_pending_play_promises: move || {
+                    let this = this.root();
+                    if generation_id != this.generation_id.get() {
+                        return;
+                    }
+
+                    this.fulfill_in_flight_play_promises(|| ());
+                }),
+                window.upcast(),
+            ).unwrap();
+        }
+
+        // Step 8.
+        self.autoplaying.set(false);
+
+        // Step 9.
+        // Not applicable here, the promise is returned from Play.
+    }
+
+    fn start(&self) {
+
+        let (action_sender, action_receiver) = ipc::channel().unwrap();
+        let trusted_node = Trusted::new(self);
+        let win = window_from_node(self);
+        let task_source = win.dom_manipulation_task_source();
+        let task_canceller = win.task_canceller();
+        ROUTER.add_route(action_receiver.to_opaque(), box move |message| {
+            let event: playground::player::PlayerEvent = message.to().unwrap();
+            println!("Event received: {:?}", event);
+            let element = trusted_node.clone();
+            let _ = task_source.queue_with_canceller(
+                task!(handle_fire_player_event: move || {
+                    element.root().handle_player_event(&event);
+                }),
+                &task_canceller,
+            );
+        });
+
+        let mut player = self.player.borrow_mut();
+        player.start();
+        player.register_event_handler(move |payload| {
+            let event: playground::player::PlayerEvent = serde_json::from_str(&payload).unwrap(); 
+            action_sender.send(event).unwrap();
+        });
+    }
+
+    pub fn handle_player_event(&self, event: &playground::player::PlayerEvent) {
+        match *event {
+            playground::player::PlayerEvent::MetadataUpdated(ref metadata) => {
+                println!("Metadata: {:?}", metadata);
+                if !self.have_metadata.get() {
+                    // https://html.spec.whatwg.org/multipage/#media-data-processing-steps-list
+                    // => "Once enough of the media data has been fetched to determine the duration..."
+                    if let Some(dur) = metadata.duration {
+                        *self.video.borrow_mut() = Some(VideoMedia {
+                            format: metadata.format.clone(),
+                            duration: Duration::seconds(dur.as_secs() as i64) +
+                                Duration::nanoseconds(dur.subsec_nanos() as i64),
+                            width: metadata.width,
+                            height: metadata.height,
+                            video: metadata.video_tracks[0].clone(),
+                            audio: Some(metadata.audio_tracks[0].clone()),
+                        });
+
+                        // Step 6
+                        self.change_ready_state(ReadyState::HaveMetadata);
+                        self.have_metadata.set(true);
+                    }
+                } else {
+                    self.change_ready_state(ReadyState::HaveCurrentData);
+                }
+            }
+            playground::player::PlayerEvent::StateChanged(ref state) => {
+                match *state {
+                    playground::player::PlaybackState::Paused => {
+                        println!("Paused!!");
+                        self.paused.set(true);
+                    }
+                    _ => {}
+                }
+            }
+            playground::player::PlayerEvent::EndOfStream => {
+                println!("EOS!");
+            }
+         }
+     }
+ 
     /// https://html.spec.whatwg.org/multipage/#internal-pause-steps
     fn internal_pause_steps(&self) {
         // Step 1.
@@ -113,32 +343,35 @@ impl HTMLMediaElement {
             self.paused.set(true);
 
             // Step 2.2.
-            // FIXME(nox): Take pending play promises and let promises be the
-            // result.
+            self.take_pending_play_promises(Err(Error::Abort));
 
             // Step 2.3.
             let window = window_from_node(self);
+            let this = Trusted::new(self);
+            let generation_id = self.generation_id.get();
             // FIXME(nox): Why are errors silenced here?
+            // FIXME(nox): Media element event task source should be used here.
             let _ = window.dom_manipulation_task_source().queue(
-                box InternalPauseStepsTask(Trusted::new(self.upcast())),
+                task!(internal_pause_steps: move || {
+                    let this = this.root();
+                    if generation_id != this.generation_id.get() {
+                        return;
+                    }
+
+                    this.fulfill_in_flight_play_promises(|| {
+                        // Step 2.3.1.
+                        this.upcast::<EventTarget>().fire_event(atom!("timeupdate"));
+
+                        // Step 2.3.2.
+                        this.upcast::<EventTarget>().fire_event(atom!("pause"));
+
+                        // Step 2.3.3.
+                        // Done after running this closure in
+                        // `fulfill_in_flight_play_promises`.
+                    });
+                }),
                 window.upcast(),
             );
-            struct InternalPauseStepsTask(Trusted<EventTarget>);
-            impl Runnable for InternalPauseStepsTask {
-                fn handler(self: Box<Self>) {
-                    let target = self.0.root();
-
-                    // Step 2.3.1.
-                    target.fire_event(atom!("timeupdate"));
-
-                    // Step 2.3.2.
-                    target.fire_event(atom!("pause"));
-
-                    // Step 2.3.3.
-                    // FIXME(nox): Reject pending play promises with promises
-                    // and an "AbortError" DOMException.
-                }
-            }
 
             // Step 2.4.
             // FIXME(nox): Set the official playback position to the current
@@ -149,188 +382,207 @@ impl HTMLMediaElement {
     // https://html.spec.whatwg.org/multipage/#notify-about-playing
     fn notify_about_playing(&self) {
         // Step 1.
-        // TODO(nox): Take pending play promises and let promises be the result.
+        self.take_pending_play_promises(Ok(()));
+
+        // phil
+        let mut player = self.player.borrow_mut();
+        player.play();
 
         // Step 2.
         let window = window_from_node(self);
+        let this = Trusted::new(self);
+        let generation_id = self.generation_id.get();
         // FIXME(nox): Why are errors silenced here?
+        // FIXME(nox): Media element event task source should be used here.
         let _ = window.dom_manipulation_task_source().queue(
-            box NotifyAboutPlayingTask(Trusted::new(self.upcast())),
+            task!(notify_about_playing: move || {
+                let this = this.root();
+                if generation_id != this.generation_id.get() {
+                    return;
+                }
+
+                this.fulfill_in_flight_play_promises(|| {
+                    // Step 2.1.
+                    this.upcast::<EventTarget>().fire_event(atom!("playing"));
+
+                    // Step 2.2.
+                    // Done after running this closure in
+                    // `fulfill_in_flight_play_promises`.
+                });
+
+            }),
             window.upcast(),
         );
-        struct NotifyAboutPlayingTask(Trusted<EventTarget>);
-        impl Runnable for NotifyAboutPlayingTask {
-            fn handler(self: Box<Self>) {
-                let target = self.0.root();
-
-                // Step 2.1.
-                target.fire_event(atom!("playing"));
-
-                // Step 2.2.
-                // FIXME(nox): Resolve pending play promises with promises.
-            }
-        }
     }
 
     // https://html.spec.whatwg.org/multipage/#ready-states
-    fn change_ready_state(&self, ready_state: u16) {
+    fn change_ready_state(&self, ready_state: ReadyState) {
         let old_ready_state = self.ready_state.get();
         self.ready_state.set(ready_state);
 
-        if self.network_state.get() == NETWORK_EMPTY {
+        if self.network_state.get() == NetworkState::Empty {
             return;
         }
 
         let window = window_from_node(self);
         let task_source = window.dom_manipulation_task_source();
 
-        // Step 1
+        // Step 1.
         match (old_ready_state, ready_state) {
-            // previous ready state was HAVE_NOTHING, and the new ready state is
-            // HAVE_METADATA
-            (HAVE_NOTHING, HAVE_METADATA) => {
+            (ReadyState::HaveNothing, ReadyState::HaveMetadata) => {
                 task_source.queue_simple_event(
                     self.upcast(),
                     atom!("loadedmetadata"),
                     &window,
                 );
-            }
 
-            // previous ready state was HAVE_METADATA and the new ready state is
-            // HAVE_CURRENT_DATA or greater
-            (HAVE_METADATA, HAVE_CURRENT_DATA) |
-            (HAVE_METADATA, HAVE_FUTURE_DATA) |
-            (HAVE_METADATA, HAVE_ENOUGH_DATA) => {
+                // No other steps are applicable in this case.
+                return;
+            },
+            (ReadyState::HaveMetadata, new) if new >= ReadyState::HaveCurrentData => {
                 if !self.fired_loadeddata_event.get() {
                     self.fired_loadeddata_event.set(true);
-                    task_source.queue_simple_event(
-                        self.upcast(),
-                        atom!("loadeddata"),
-                        &window,
+                    let this = Trusted::new(self);
+                    // FIXME(nox): Why are errors silenced here?
+                    let _ = task_source.queue(
+                        task!(media_reached_current_data: move || {
+                            let this = this.root();
+                            this.upcast::<EventTarget>().fire_event(atom!("loadeddata"));
+                            this.delay_load_event(false);
+                        }),
+                        window.upcast(),
                     );
                 }
-            }
 
-            // previous ready state was HAVE_FUTURE_DATA or more, and the new ready
-            // state is HAVE_CURRENT_DATA or less
-            (HAVE_FUTURE_DATA, HAVE_CURRENT_DATA) |
-            (HAVE_ENOUGH_DATA, HAVE_CURRENT_DATA) |
-            (HAVE_FUTURE_DATA, HAVE_METADATA) |
-            (HAVE_ENOUGH_DATA, HAVE_METADATA) |
-            (HAVE_FUTURE_DATA, HAVE_NOTHING) |
-            (HAVE_ENOUGH_DATA, HAVE_NOTHING) => {
-                // TODO: timeupdate event logic + waiting
-            }
+                // Steps for the transition from HaveMetadata to HaveCurrentData
+                // or HaveFutureData also apply here, as per the next match
+                // expression.
+            },
+            (ReadyState::HaveFutureData, new) if new <= ReadyState::HaveCurrentData => {
+                // FIXME(nox): Queue a task to fire timeupdate and waiting
+                // events if the conditions call from the spec are met.
+
+                // No other steps are applicable in this case.
+                return;
+            },
 
             _ => (),
         }
 
-        // Step 1
-        // If the new ready state is HAVE_FUTURE_DATA or HAVE_ENOUGH_DATA,
-        // then the relevant steps below must then be run also.
-        match (old_ready_state, ready_state) {
-            // previous ready state was HAVE_CURRENT_DATA or less, and the new ready
-            // state is HAVE_FUTURE_DATA
-            (HAVE_CURRENT_DATA, HAVE_FUTURE_DATA) |
-            (HAVE_METADATA, HAVE_FUTURE_DATA) |
-            (HAVE_NOTHING, HAVE_FUTURE_DATA) => {
-                task_source.queue_simple_event(
-                    self.upcast(),
-                    atom!("canplay"),
-                    &window,
-                );
+        if old_ready_state <= ReadyState::HaveCurrentData && ready_state >= ReadyState::HaveFutureData {
+            task_source.queue_simple_event(
+                self.upcast(),
+                atom!("canplay"),
+                &window,
+            );
 
-                if !self.Paused() {
-                    self.notify_about_playing();
-                }
+            if !self.Paused() {
+                self.notify_about_playing();
             }
-
-            // new ready state is HAVE_ENOUGH_DATA
-            (_, HAVE_ENOUGH_DATA) => {
-                if old_ready_state <= HAVE_CURRENT_DATA {
-                    task_source.queue_simple_event(
-                        self.upcast(),
-                        atom!("canplay"),
-                        &window,
-                    );
-
-                    if !self.Paused() {
-                        self.notify_about_playing();
-                    }
-                }
-
-                //TODO: check sandboxed automatic features browsing context flag
-                if self.autoplaying.get() &&
-                   self.Paused() &&
-                   self.Autoplay() {
-                    // Step 1
-                    self.paused.set(false);
-                    // TODO step 2: show poster
-                    // Step 3
-                    task_source.queue_simple_event(
-                        self.upcast(),
-                        atom!("play"),
-                        &window,
-                    );
-                    // Step 4
-                    self.notify_about_playing();
-                    // Step 5
-                    self.autoplaying.set(false);
-                }
-
-                task_source.queue_simple_event(
-                    self.upcast(),
-                    atom!("canplaythrough"),
-                    &window,
-                );
-            }
-
-            _ => (),
         }
 
-        // TODO Step 2: media controller
+        if ready_state == ReadyState::HaveEnoughData {
+            // TODO: Check sandboxed automatic features browsing context flag.
+            // FIXME(nox): I have no idea what this TODO is about.
+
+            // FIXME(nox): Review this block.
+            if self.autoplaying.get() &&
+                self.Paused() &&
+                self.Autoplay() {
+                // Step 1
+                self.paused.set(false);
+                // TODO step 2: show poster
+                // Step 3
+                task_source.queue_simple_event(
+                    self.upcast(),
+                    atom!("play"),
+                    &window,
+                );
+                // Step 4
+                self.notify_about_playing();
+                // Step 5
+                self.autoplaying.set(false);
+            }
+
+            // FIXME(nox): According to the spec, this should come *before* the
+            // "play" event.
+            task_source.queue_simple_event(
+                self.upcast(),
+                atom!("canplaythrough"),
+                &window,
+            );
+        }
     }
 
     // https://html.spec.whatwg.org/multipage/#concept-media-load-algorithm
     fn invoke_resource_selection_algorithm(&self) {
-        // Step 1
-        self.network_state.set(NETWORK_NO_SOURCE);
+        // Step 1.
+        self.network_state.set(NetworkState::NoSource);
 
-        // TODO step 2 (show poster)
-        // TODO step 3 (delay load event)
+        // Step 2.
+        // FIXME(nox): Set show poster flag to true.
 
-        // Step 4
+        // Step 3.
+        self.delay_load_event(true);
+
+        // Step 4.
+        // If the resource selection mode in the synchronous section is
+        // "attribute", the URL of the resource to fetch is relative to the
+        // media element's node document when the src attribute was last
+        // changed, which is why we need to pass the base URL in the task
+        // right here.
         let doc = document_from_node(self);
         let task = MediaElementMicrotask::ResourceSelectionTask {
-            elem: Root::from_ref(self),
+            elem: DomRoot::from_ref(self),
             base_url: doc.base_url()
         };
+
+        // FIXME(nox): This will later call the resource_selection_algorith_sync
+        // method from below, if microtasks were trait objects, we would be able
+        // to put the code directly in this method, without the boilerplate
+        // indirections.
         ScriptThread::await_stable_state(Microtask::MediaElement(task));
     }
 
     // https://html.spec.whatwg.org/multipage/#concept-media-load-algorithm
-    #[allow(unreachable_code)]
     fn resource_selection_algorithm_sync(&self, base_url: ServoUrl) {
-        // TODO step 5 (populate pending text tracks)
+        // Step 5.
+        // FIXME(nox): Maybe populate the list of pending text tracks.
 
-        // Step 6
-        let mode = if false {
-            // TODO media provider object
-            ResourceSelectionMode::Object
-        } else if let Some(attr) = self.upcast::<Element>().get_attribute(&ns!(), &local_name!("src")) {
-            ResourceSelectionMode::Attribute(attr.Value().to_string())
-        } else if false {  // TODO: when implementing this remove #[allow(unreachable_code)] above.
-            // TODO <source> child
-            ResourceSelectionMode::Children(panic!())
+        // Step 6.
+        enum Mode {
+            // FIXME(nox): Support media object provider.
+            #[allow(dead_code)]
+            Object,
+            Attribute(String),
+            Children(DomRoot<HTMLSourceElement>),
+        }
+        fn mode(media: &HTMLMediaElement) -> Option<Mode> {
+            if let Some(attr) = media.upcast::<Element>().get_attribute(&ns!(), &local_name!("src")) {
+                return Some(Mode::Attribute(attr.Value().into()));
+            }
+            let source_child_element = media.upcast::<Node>()
+                .children()
+                .filter_map(DomRoot::downcast::<HTMLSourceElement>)
+                .next();
+            if let Some(element) = source_child_element {
+                return Some(Mode::Children(element));
+            }
+            None
+        }
+        let mode = if let Some(mode) = mode(self) {
+            mode
         } else {
-            self.network_state.set(NETWORK_EMPTY);
+            self.network_state.set(NetworkState::Empty);
+            // https://github.com/whatwg/html/issues/3065
+            self.delay_load_event(false);
             return;
         };
 
-        // Step 7
-        self.network_state.set(NETWORK_LOADING);
+        // Step 7.
+        self.network_state.set(NetworkState::Loading);
 
-        // Step 8
+        // Step 8.
         let window = window_from_node(self);
         window.dom_manipulation_task_source().queue_simple_event(
             self.upcast(),
@@ -338,137 +590,185 @@ impl HTMLMediaElement {
             &window,
         );
 
-        // Step 9
+        // Step 9.
         match mode {
-            ResourceSelectionMode::Object => {
-                // Step 1
+            // Step 9.obj.
+            Mode::Object => {
+                // Step 9.obj.1.
                 *self.current_src.borrow_mut() = "".to_owned();
 
-                // Step 4
-                self.resource_fetch_algorithm(Resource::Object);
-            }
+                // Step 9.obj.2.
+                // FIXME(nox): The rest of the steps should be ran in parallel.
 
-            ResourceSelectionMode::Attribute(src) => {
-                // Step 1
+                // Step 9.obj.3.
+                // Note that the resource fetch algorithm itself takes care
+                // of the cleanup in case of failure itself.
+                // FIXME(nox): Pass the assigned media provider here.
+                self.resource_fetch_algorithm(Resource::Object);
+            },
+            Mode::Attribute(src) => {
+                // Step 9.attr.1.
                 if src.is_empty() {
                     self.queue_dedicated_media_source_failure_steps();
                     return;
                 }
 
-                // Step 2
-                let absolute_url = base_url.join(&src).map_err(|_| ());
+                // Step 9.attr.2.
+                let url_record = match base_url.join(&src) {
+                    Ok(url) => url,
+                    Err(_) => {
+                        self.queue_dedicated_media_source_failure_steps();
+                        return;
+                    }
+                };
 
-                // Step 3
-                if let Ok(url) = absolute_url {
-                    *self.current_src.borrow_mut() = url.as_str().into();
-                    // Step 4
-                    self.resource_fetch_algorithm(Resource::Url(url));
-                } else {
-                    self.queue_dedicated_media_source_failure_steps();
-                }
-            }
+                // Step 9.attr.3.
+                *self.current_src.borrow_mut() = url_record.as_str().into();
 
-            ResourceSelectionMode::Children(_child) => {
-                // TODO
+                // Step 9.attr.4.
+                // Note that the resource fetch algorithm itself takes care
+                // of the cleanup in case of failure itself.
+                self.resource_fetch_algorithm(Resource::Url(url_record));
+            },
+            Mode::Children(_source) => {
+                // Step 9.children.
                 self.queue_dedicated_media_source_failure_steps()
-            }
+            },
         }
     }
 
     // https://html.spec.whatwg.org/multipage/#concept-media-load-resource
     fn resource_fetch_algorithm(&self, resource: Resource) {
-        // TODO step 3 (remove text tracks)
+        // Steps 1-2.
+        // Unapplicable, the `resource` variable already conveys which mode
+        // is in use.
 
-        // Step 4
-        if let Resource::Url(url) = resource {
-            // 4.1
-            if self.Preload() == "none" && !self.autoplaying.get() {
-                // 4.1.1
-                self.network_state.set(NETWORK_IDLE);
+        // Step 3.
+        // FIXME(nox): Remove all media-resource-specific text tracks.
 
-                // 4.1.2
+        // Step 4.
+        match resource {
+            Resource::Url(url) => {
+                // Step 4.remote.1.
+                if self.Preload() == "none" && !self.autoplaying.get() {
+                    // Step 4.remote.1.1.
+                    self.network_state.set(NetworkState::Idle);
+
+                    // Step 4.remote.1.2.
+                    let window = window_from_node(self);
+                    window.dom_manipulation_task_source().queue_simple_event(
+                        self.upcast(),
+                        atom!("suspend"),
+                        &window,
+                    );
+
+                    // Step 4.remote.1.3.
+                    let this = Trusted::new(self);
+                    window.dom_manipulation_task_source().queue(
+                        task!(set_media_delay_load_event_flag_to_false: move || {
+                            this.root().delay_load_event(false);
+                        }),
+                        window.upcast(),
+                    ).unwrap();
+
+                    // Steps 4.remote.1.4.
+                    // FIXME(nox): Somehow we should wait for the task from previous
+                    // step to be ran before continuing.
+
+                    // Steps 4.remote.1.5-4.remote.1.7.
+                    // FIXME(nox): Wait for an implementation-defined event and
+                    // then continue with the normal set of steps instead of just
+                    // returning.
+                    return;
+                }
+
+                // Step 4.remote.2.
+                // FIXME(nox): Handle CORS setting from crossorigin attribute.
+                let document = document_from_node(self);
+                let type_ = match self.media_type_id() {
+                    HTMLMediaElementTypeId::HTMLAudioElement => RequestType::Audio,
+                    HTMLMediaElementTypeId::HTMLVideoElement => RequestType::Video,
+                };
+                let request = RequestInit {
+                    url,
+                    type_,
+                    destination: Destination::Media,
+                    credentials_mode: CredentialsMode::Include,
+                    use_url_credentials: true,
+                    origin: document.origin().immutable().clone(),
+                    pipeline_id: Some(self.global().pipeline_id()),
+                    referrer_url: Some(document.url()),
+                    referrer_policy: document.get_referrer_policy(),
+                    .. RequestInit::default()
+                };
+
+                let context = Arc::new(Mutex::new(HTMLMediaElementContext::new(self)));
+                self.start();
+                let (action_sender, action_receiver) = ipc::channel().unwrap();
                 let window = window_from_node(self);
-                window.dom_manipulation_task_source().queue_simple_event(
-                    self.upcast(),
-                    atom!("suspend"),
-                    &window,
-                );
-
-                // TODO 4.1.3 (delay load flag)
-
-                // TODO 4.1.5-7 (state for load that initiates later)
-                return;
-            }
-
-            // 4.2
-            let context = Arc::new(Mutex::new(HTMLMediaElementContext::new(self, url.clone())));
-            let (action_sender, action_receiver) = ipc::channel().unwrap();
-            let window = window_from_node(self);
-            let listener = NetworkListener {
-                context: context,
-                task_source: window.networking_task_source(),
-                wrapper: Some(window.get_runnable_wrapper())
-            };
-
-            ROUTER.add_route(action_receiver.to_opaque(), box move |message| {
-                listener.notify_fetch(message.to().unwrap());
-            });
-
-            // FIXME: we're supposed to block the load event much earlier than now
-            let document = document_from_node(self);
-
-            let ty = if self.is::<HTMLAudioElement>() {
-                RequestType::Audio
-            } else if self.is::<HTMLVideoElement>() {
-                RequestType::Video
-            } else {
-                unreachable!("Unexpected HTMLMediaElement")
-            };
-
-            let request = RequestInit {
-                url: url.clone(),
-                type_: ty,
-                destination: Destination::Media,
-                credentials_mode: CredentialsMode::Include,
-                use_url_credentials: true,
-                origin: document.origin().immutable().clone(),
-                pipeline_id: Some(self.global().pipeline_id()),
-                referrer_url: Some(document.url()),
-                referrer_policy: document.get_referrer_policy(),
-                .. RequestInit::default()
-            };
-
-            document.fetch_async(LoadType::Media(url), request, action_sender);
-        } else {
-            // TODO local resource fetch
-            self.queue_dedicated_media_source_failure_steps();
+                let listener = NetworkListener {
+                    context: context,
+                    task_source: window.networking_task_source(),
+                    canceller: Some(window.task_canceller())
+                };
+                ROUTER.add_route(action_receiver.to_opaque(), box move |message| {
+                    listener.notify_fetch(message.to().unwrap());
+                });
+                document.loader().fetch_async_background(request, action_sender);
+            },
+            Resource::Object => {
+                // FIXME(nox): Use the current media resource.
+                self.queue_dedicated_media_source_failure_steps();
+            },
         }
     }
 
+    /// Queues a task to run the [dedicated media source failure steps][steps].
+    ///
+    /// [steps]: https://html.spec.whatwg.org/multipage/#dedicated-media-source-failure-steps
     fn queue_dedicated_media_source_failure_steps(&self) {
         let window = window_from_node(self);
+        let this = Trusted::new(self);
+        let generation_id = self.generation_id.get();
+        self.take_pending_play_promises(Err(Error::NotSupported));
+        // FIXME(nox): Why are errors silenced here?
+        // FIXME(nox): Media element event task source should be used here.
         let _ = window.dom_manipulation_task_source().queue(
-            box DedicatedMediaSourceFailureTask::new(self), window.upcast());
-    }
+            task!(dedicated_media_source_failure_steps: move || {
+                let this = this.root();
+                if generation_id != this.generation_id.get() {
+                    return;
+                }
 
-    // https://html.spec.whatwg.org/multipage/#dedicated-media-source-failure-steps
-    fn dedicated_media_source_failure(&self) {
-        // Step 1
-        self.error.set(Some(&*MediaError::new(&*window_from_node(self),
-                                              MEDIA_ERR_SRC_NOT_SUPPORTED)));
+                this.fulfill_in_flight_play_promises(|| {
+                    // Step 1.
+                    this.error.set(Some(&*MediaError::new(
+                        &window_from_node(&*this),
+                        MEDIA_ERR_SRC_NOT_SUPPORTED,
+                    )));
 
-        // TODO step 2 (forget resource tracks)
+                    // Step 2.
+                    // FIXME(nox): Forget the media-resource-specific tracks.
 
-        // Step 3
-        self.network_state.set(NETWORK_NO_SOURCE);
+                    // Step 3.
+                    this.network_state.set(NetworkState::NoSource);
 
-        // TODO step 4 (show poster)
+                    // Step 4.
+                    // FIXME(nox): Set show poster flag to true.
 
-        // Step 5
-        self.upcast::<EventTarget>().fire_event(atom!("error"));
+                    // Step 5.
+                    this.upcast::<EventTarget>().fire_event(atom!("error"));
 
-        // TODO step 6 (resolve pending play promises)
-        // TODO step 7 (delay load event)
+                    // Step 6.
+                    // Done after running this closure in
+                    // `fulfill_in_flight_play_promises`.
+                });
+
+                // Step 7.
+                this.delay_load_event(false);
+            }),
+            window.upcast(),
+        );
     }
 
     // https://html.spec.whatwg.org/multipage/#media-element-load-algorithm
@@ -477,71 +777,159 @@ impl HTMLMediaElement {
         // this invokation of the load algorithm.
         self.fired_loadeddata_event.set(false);
 
-        // TODO Step 1 (abort resource selection algorithm instances)
+        // Step 1.
+        // FIXME(nox): Abort any already-running instance of the
+        // resource selection algorithm.
 
-        // Step 2
+        // Steps 2-4.
         self.generation_id.set(self.generation_id.get() + 1);
-        // TODO reject pending play promises
+        while !self.in_flight_play_promises_queue.borrow().is_empty() {
+            self.fulfill_in_flight_play_promises(|| ());
+        }
 
         let window = window_from_node(self);
         let task_source = window.dom_manipulation_task_source();
 
-        // Step 3
-        let network_state = self.NetworkState();
-        if network_state == NETWORK_LOADING || network_state == NETWORK_IDLE {
-            task_source.queue_simple_event(
-                self.upcast(),
-                atom!("abort"),
-                &window,
-            );
+        // Step 5.
+        let network_state = self.network_state.get();
+        if network_state == NetworkState::Loading || network_state == NetworkState::Idle {
+            task_source.queue_simple_event(self.upcast(), atom!("abort"), &window);
         }
 
-        // Step 4
-        if network_state != NETWORK_EMPTY {
-            // 4.1
+        // Step 6.
+        if network_state != NetworkState::Empty {
+            // Step 6.1.
             task_source.queue_simple_event(self.upcast(), atom!("emptied"), &window);
 
-            // TODO 4.2 (abort in-progress fetch)
+            // Step 6.2.
+            // FIXME(nox): Abort in-progress fetching process.
 
-            // TODO 4.3 (detach media provider object)
-            // TODO 4.4 (forget resource tracks)
+            // Step 6.3.
+            // FIXME(nox): Detach MediaSource media provider object.
 
-            // 4.5
-            if self.ready_state.get() != HAVE_NOTHING {
-                self.change_ready_state(HAVE_NOTHING);
+            // Step 6.4.
+            // FIXME(nox): Forget the media-resource-specific tracks.
+
+            // Step 6.5.
+            if self.ready_state.get() != ReadyState::HaveNothing {
+                self.change_ready_state(ReadyState::HaveNothing);
             }
 
-            // 4.6
+            // Step 6.6.
             if !self.Paused() {
+                // Step 6.6.1.
                 self.paused.set(true);
+
+                // Step 6.6.2.
+                self.take_pending_play_promises(Err(Error::Abort));
+                self.fulfill_in_flight_play_promises(|| ());
             }
-            // TODO 4.7 (seeking)
-            // TODO 4.8 (playback position)
-            // TODO 4.9 (timeline offset)
-            // TODO 4.10 (duration)
+
+            // Step 6.7.
+            // FIXME(nox): If seeking is true, set it to false.
+
+            // Step 6.8.
+            // FIXME(nox): Set current and official playback position to 0 and
+            // maybe queue a task to fire a timeupdate event.
+
+            // Step 6.9.
+            // FIXME(nox): Set timeline offset to NaN.
+
+            // Step 6.10.
+            // FIXME(nox): Set duration to NaN.
         }
 
-        // TODO step 5 (playback rate)
-        // Step 6
+        // Step 7.
+        // FIXME(nox): Set playbackRate to defaultPlaybackRate.
+
+        // Step 8.
         self.error.set(None);
         self.autoplaying.set(true);
 
-        // Step 7
+        // Step 9.
         self.invoke_resource_selection_algorithm();
 
-        // TODO step 8 (stop previously playing resource)
+        // Step 10.
+        // FIXME(nox): Stop playback of any previously running media resource.
+    }
+
+    /// Appends a promise to the list of pending play promises.
+    #[allow(unrooted_must_root)]
+    fn push_pending_play_promise(&self, promise: &Rc<Promise>) {
+        self.pending_play_promises.borrow_mut().push(promise.clone());
+    }
+
+    /// Takes the pending play promises.
+    ///
+    /// The result with which these promises will be fulfilled is passed here
+    /// and this method returns nothing because we actually just move the
+    /// current list of pending play promises to the
+    /// `in_flight_play_promises_queue` field.
+    ///
+    /// Each call to this method must be followed by a call to
+    /// `fulfill_in_flight_play_promises`, to actually fulfill the promises
+    /// which were taken and moved to the in-flight queue.
+    #[allow(unrooted_must_root)]
+    fn take_pending_play_promises(&self, result: ErrorResult) {
+        let pending_play_promises = mem::replace(
+            &mut *self.pending_play_promises.borrow_mut(),
+            vec![],
+        );
+        self.in_flight_play_promises_queue.borrow_mut().push_back((
+            pending_play_promises.into(),
+            result,
+        ));
+    }
+
+    /// Fulfills the next in-flight play promises queue after running a closure.
+    ///
+    /// See the comment on `take_pending_play_promises` for why this method
+    /// does not take a list of promises to fulfill. Callers cannot just pop
+    /// the front list off of `in_flight_play_promises_queue` and later fulfill
+    /// the promises because that would mean putting
+    /// `#[allow(unrooted_must_root)]` on even more functions, potentially
+    /// hiding actual safety bugs.
+    #[allow(unrooted_must_root)]
+    fn fulfill_in_flight_play_promises<F>(&self, f: F)
+    where
+        F: FnOnce(),
+    {
+        let (promises, result) = self.in_flight_play_promises_queue
+            .borrow_mut()
+            .pop_front()
+            .expect("there should be at least one list of in flight play promises");
+        f();
+        for promise in &*promises {
+            match result {
+                Ok(ref value) => promise.resolve_native(value),
+                Err(ref error) => promise.reject_error(error.clone()),
+            }
+        }
+    }
+
+    /// Handles insertion of `source` children.
+    ///
+    /// https://html.spec.whatwg.org/multipage/#the-source-element:nodes-are-inserted
+    pub fn handle_source_child_insertion(&self) {
+        if self.upcast::<Element>().has_attribute(&local_name!("src")) {
+            return;
+        }
+        if self.network_state.get() != NetworkState::Empty {
+            return;
+        }
+        self.media_element_load_algorithm();
     }
 }
 
 impl HTMLMediaElementMethods for HTMLMediaElement {
     // https://html.spec.whatwg.org/multipage/#dom-media-networkstate
     fn NetworkState(&self) -> u16 {
-        self.network_state.get()
+        self.network_state.get() as u16
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-media-readystate
     fn ReadyState(&self) -> u16 {
-        self.ready_state.get()
+        self.ready_state.get() as u16
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-media-autoplay
@@ -571,82 +959,33 @@ impl HTMLMediaElementMethods for HTMLMediaElement {
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-navigator-canplaytype
-    fn CanPlayType(&self, _type_: DOMString) -> CanPlayTypeResult {
-        // TODO: application/octet-stream
-        CanPlayTypeResult::Maybe
+    fn CanPlayType(&self, type_: DOMString) -> CanPlayTypeResult {
+        match type_.parse::<Mime>() {
+            Ok(Mime(TopLevel::Application, SubLevel::OctetStream, _)) |
+            Err(_) => {
+                CanPlayTypeResult::_empty
+            },
+            _ => CanPlayTypeResult::Maybe
+        }
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-media-error
-    fn GetError(&self) -> Option<Root<MediaError>> {
+    fn GetError(&self) -> Option<DomRoot<MediaError>> {
         self.error.get()
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-media-play
-    fn Play(&self) {
-        // TODO step 1
-
-        // Step 2
-        if self.error.get().map_or(false, |e| e.Code() == MEDIA_ERR_SRC_NOT_SUPPORTED) {
-            // TODO return rejected promise
-            return;
-        }
-
-        // TODO step 3
-
-        // Step 4
-        if self.network_state.get() == NETWORK_EMPTY {
-            self.invoke_resource_selection_algorithm();
-        }
-
-        // TODO step 5 (seek backwards)
-
-        // TODO step 6 (media controller)
-
-        let state = self.ready_state.get();
-
-        // Step 7
-        if self.Paused() {
-            // 7.1
-            self.paused.set(false);
-
-            // TODO 7.2 (show poster)
-
-            let window = window_from_node(self);
-            let task_source = window.dom_manipulation_task_source();
-
-            // 7.3
-            task_source.queue_simple_event(self.upcast(), atom!("play"), &window);
-
-            // 7.4
-            if state == HAVE_NOTHING ||
-               state == HAVE_METADATA ||
-               state == HAVE_CURRENT_DATA {
-                task_source.queue_simple_event(
-                    self.upcast(),
-                    atom!("waiting"),
-                    &window,
-                );
-            } else {
-                self.notify_about_playing();
-            }
-        }
-        // Step 8
-        else if state == HAVE_FUTURE_DATA || state == HAVE_ENOUGH_DATA {
-            // TODO resolve pending play promises
-        }
-
-        // Step 9
-        self.autoplaying.set(false);
-
-        // TODO step 10 (media controller)
-
-        // TODO return promise
+    #[allow(unrooted_must_root)]
+    fn Play(&self) -> Rc<Promise> {
+        let promise = Promise::new(&self.global());
+        self.play(&promise);
+        promise
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-media-pause
     fn Pause(&self) {
         // Step 1
-        if self.network_state.get() == NETWORK_EMPTY {
+        if self.network_state.get() == NetworkState::Empty {
             self.invoke_resource_selection_algorithm();
         }
 
@@ -684,7 +1023,7 @@ impl VirtualMethods for HTMLMediaElement {
 
         if context.tree_in_doc {
             let task = MediaElementMicrotask::PauseIfNotInDocumentTask {
-                elem: Root::from_ref(self)
+                elem: DomRoot::from_ref(self)
             };
             ScriptThread::await_stable_state(Microtask::MediaElement(task));
         }
@@ -694,11 +1033,11 @@ impl VirtualMethods for HTMLMediaElement {
 #[derive(HeapSizeOf, JSTraceable)]
 pub enum MediaElementMicrotask {
     ResourceSelectionTask {
-        elem: Root<HTMLMediaElement>,
+        elem: DomRoot<HTMLMediaElement>,
         base_url: ServoUrl
     },
     PauseIfNotInDocumentTask {
-        elem: Root<HTMLMediaElement>,
+        elem: DomRoot<HTMLMediaElement>,
     }
 }
 
@@ -717,60 +1056,35 @@ impl MicrotaskRunnable for MediaElementMicrotask {
     }
 }
 
-struct DedicatedMediaSourceFailureTask {
-    elem: Trusted<HTMLMediaElement>,
-}
-
-impl DedicatedMediaSourceFailureTask {
-    fn new(elem: &HTMLMediaElement) -> DedicatedMediaSourceFailureTask {
-        DedicatedMediaSourceFailureTask {
-            elem: Trusted::new(elem),
-        }
-    }
-}
-
-impl Runnable for DedicatedMediaSourceFailureTask {
-    fn handler(self: Box<DedicatedMediaSourceFailureTask>) {
-        self.elem.root().dedicated_media_source_failure();
-    }
-}
-
-enum ResourceSelectionMode {
-    Object,
-    Attribute(String),
-    Children(Root<HTMLSourceElement>),
-}
-
 enum Resource {
     Object,
     Url(ServoUrl),
 }
 
+#[derive(Clone)]
 struct HTMLMediaElementContext {
     /// The element that initiated the request.
     elem: Trusted<HTMLMediaElement>,
     /// The response body received to date.
-    data: Vec<u8>,
+    //data: Vec<u8>,
     /// The response metadata received to date.
     metadata: Option<Metadata>,
     /// The generation of the media element when this fetch started.
     generation_id: u32,
     /// Time of last progress notification.
     next_progress_event: Timespec,
-    /// Url of resource requested.
-    url: ServoUrl,
     /// Whether the media metadata has been completely received.
-    have_metadata: bool,
+    //have_metadata: bool,
     /// True if this response is invalid and should be ignored.
     ignore_response: bool,
 }
 
+// https://html.spec.whatwg.org/multipage/#media-data-processing-steps-list
 impl FetchResponseListener for HTMLMediaElementContext {
     fn process_request_body(&mut self) {}
 
     fn process_request_eof(&mut self) {}
 
-    // https://html.spec.whatwg.org/multipage/#media-data-processing-steps-list
     fn process_response(&mut self, metadata: Result<FetchMetadata, NetworkError>) {
         self.metadata = metadata.ok().map(|m| {
             match m {
@@ -779,37 +1093,36 @@ impl FetchResponseListener for HTMLMediaElementContext {
             }
         });
 
+        let status_is_ok = self.metadata.as_ref()
+            .and_then(|m| m.status.as_ref())
+            .map_or(true, |s| s.0 >= 200 && s.0 < 300);
+
         // => "If the media data cannot be fetched at all..."
-        let is_failure = self.metadata
-                             .as_ref()
-                             .and_then(|m| m.status
-                                            .as_ref()
-                                            .map(|&(s, _)| s < 200 || s >= 300))
-                             .unwrap_or(false);
-        if is_failure {
+        if !status_is_ok {
             // Ensure that the element doesn't receive any further notifications
-            // of the aborted fetch. The dedicated failure steps will be executed
-            // when response_complete runs.
+            // of the aborted fetch.
             self.ignore_response = true;
+            self.elem.root().queue_dedicated_media_source_failure_steps();
         }
     }
 
-    fn process_response_chunk(&mut self, mut payload: Vec<u8>) {
+    fn process_response_chunk(&mut self, payload: Vec<u8>) {
         if self.ignore_response {
+            // An error was received previously, skip processing the payload.
             return;
         }
 
-        self.data.append(&mut payload);
-
         let elem = self.elem.root();
+        let player = elem.player.borrow_mut();
+        player.push_data(payload.as_ref());
 
         // https://html.spec.whatwg.org/multipage/#media-data-processing-steps-list
         // => "Once enough of the media data has been fetched to determine the duration..."
-        if !self.have_metadata {
-            self.check_metadata(&elem);
-        } else {
-            elem.change_ready_state(HAVE_CURRENT_DATA);
-        }
+        // if !self.have_metadata {
+        //     self.check_metadata(&elem);
+        // } else {
+        //     elem.change_ready_state(ReadyState::HaveCurrentData);
+        // }
 
         // https://html.spec.whatwg.org/multipage/#concept-media-load-resource step 4,
         // => "If mode is remote" step 2
@@ -826,33 +1139,39 @@ impl FetchResponseListener for HTMLMediaElementContext {
 
     // https://html.spec.whatwg.org/multipage/#media-data-processing-steps-list
     fn process_response_eof(&mut self, status: Result<(), NetworkError>) {
+        if self.ignore_response {
+            // An error was received previously, skip processing the payload.
+            return;
+        }
         let elem = self.elem.root();
 
         // => "If the media data can be fetched but is found by inspection to be in an unsupported
         //     format, or can otherwise not be rendered at all"
-        if !self.have_metadata {
-            elem.queue_dedicated_media_source_failure_steps();
-        }
+        // if !elem.have_metadata.get() {
+        //     elem.queue_dedicated_media_source_failure_steps();
+        // }
         // => "Once the entire media resource has been fetched..."
-        else if status.is_ok() {
-            elem.change_ready_state(HAVE_ENOUGH_DATA);
+        if status.is_ok() {
+            println!("ok");
+            elem.change_ready_state(ReadyState::HaveEnoughData);
 
             elem.upcast::<EventTarget>().fire_event(atom!("progress"));
 
-            elem.network_state.set(NETWORK_IDLE);
+            elem.network_state.set(NetworkState::Idle);
 
             elem.upcast::<EventTarget>().fire_event(atom!("suspend"));
         }
         // => "If the connection is interrupted after some media data has been received..."
-        else if elem.ready_state.get() != HAVE_NOTHING {
+        else if elem.ready_state.get() != ReadyState::HaveNothing {
             // Step 2
             elem.error.set(Some(&*MediaError::new(&*window_from_node(&*elem),
                                                   MEDIA_ERR_NETWORK)));
 
             // Step 3
-            elem.network_state.set(NETWORK_IDLE);
+            elem.network_state.set(NetworkState::Idle);
 
-            // TODO: Step 4 - update delay load flag
+            // Step 4.
+            elem.delay_load_event(false);
 
             // Step 5
             elem.upcast::<EventTarget>().fire_event(atom!("error"));
@@ -860,9 +1179,6 @@ impl FetchResponseListener for HTMLMediaElementContext {
             // => "If the media data cannot be fetched at all..."
             elem.queue_dedicated_media_source_failure_steps();
         }
-
-        let document = document_from_node(&*elem);
-        document.finish_load(LoadType::Media(self.url.clone()));
     }
 }
 
@@ -874,37 +1190,34 @@ impl PreInvoke for HTMLMediaElementContext {
 }
 
 impl HTMLMediaElementContext {
-    fn new(elem: &HTMLMediaElement, url: ServoUrl) -> HTMLMediaElementContext {
+    fn new(elem: &HTMLMediaElement) -> HTMLMediaElementContext {
         HTMLMediaElementContext {
             elem: Trusted::new(elem),
-            data: vec![],
             metadata: None,
             generation_id: elem.generation_id.get(),
             next_progress_event: time::get_time() + Duration::milliseconds(350),
-            url: url,
-            have_metadata: false,
             ignore_response: false,
         }
     }
 
-    fn check_metadata(&mut self, elem: &HTMLMediaElement) {
-        match audio_video_metadata::get_format_from_slice(&self.data) {
-            Ok(audio_video_metadata::Metadata::Video(meta)) => {
-                let dur = meta.audio.duration.unwrap_or(::std::time::Duration::new(0, 0));
-                *elem.video.borrow_mut() = Some(VideoMedia {
-                    format: format!("{:?}", meta.format),
-                    duration: Duration::seconds(dur.as_secs() as i64) +
-                              Duration::nanoseconds(dur.subsec_nanos() as i64),
-                    width: meta.dimensions.width,
-                    height: meta.dimensions.height,
-                    video: meta.video.unwrap_or("".to_owned()),
-                    audio: meta.audio.audio,
-                });
-                // Step 6
-                elem.change_ready_state(HAVE_METADATA);
-                self.have_metadata = true;
-            }
-            _ => {}
-        }
-    }
+//    fn check_metadata(&mut self, elem: &HTMLMediaElement) {
+//        match audio_video_metadata::get_format_from_slice(&self.data) {
+//            Ok(audio_video_metadata::Metadata::Video(meta)) => {
+//                let dur = meta.audio.duration.unwrap_or(::std::time::Duration::new(0, 0));
+//                *elem.video.borrow_mut() = Some(VideoMedia {
+//                    format: format!("{:?}", meta.format),
+//                    duration: Duration::seconds(dur.as_secs() as i64) +
+//                              Duration::nanoseconds(dur.subsec_nanos() as i64),
+//                    width: meta.dimensions.width,
+//                    height: meta.dimensions.height,
+//                    video: meta.video.unwrap_or("".to_owned()),
+//                    audio: meta.audio.audio,
+//                });
+//                // Step 6
+//                elem.change_ready_state(ReadyState::HaveMetadata);
+//                self.have_metadata = true;
+//            }
+//            _ => {}
+//        }
+//    }
 }

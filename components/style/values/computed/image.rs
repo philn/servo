@@ -13,6 +13,8 @@ use std::fmt;
 use style_traits::ToCss;
 use values::{Either, None_};
 use values::computed::{Angle, ComputedUrl, Context, Length, LengthOrPercentage, NumberOrPercentage, ToComputedValue};
+#[cfg(feature = "gecko")]
+use values::computed::Percentage;
 use values::computed::position::Position;
 use values::generics::image::{CompatMode, ColorStop as GenericColorStop, EndingShape as GenericEndingShape};
 use values::generics::image::{Gradient as GenericGradient, GradientItem as GenericGradientItem};
@@ -50,6 +52,7 @@ pub type GradientKind = GenericGradientKind<
 
 /// A computed gradient line direction.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "gecko", derive(MallocSizeOf))]
 #[cfg_attr(feature = "servo", derive(HeapSizeOf))]
 pub enum LineDirection {
     /// An angle.
@@ -87,7 +90,13 @@ impl GenericLineDirection for LineDirection {
                 if compat_mode != CompatMode::Modern => true,
             LineDirection::Corner(..) => false,
             #[cfg(feature = "gecko")]
-            LineDirection::MozPosition(_, _) => false,
+            LineDirection::MozPosition(Some(Position {
+                horizontal: LengthOrPercentage::Percentage(Percentage(x)),
+                vertical: LengthOrPercentage::Percentage(Percentage(y)),
+            }), None) => {
+                // `50% 0%` is the default value for line direction.
+                x == 0.5 && y == 0.0
+            },
             _ => false,
         }
     }

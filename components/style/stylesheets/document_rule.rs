@@ -7,13 +7,15 @@
 //! We implement the prefixed `@-moz-document`.
 
 use cssparser::{Parser, Token, SourceLocation, BasicParseError};
+#[cfg(feature = "gecko")]
+use malloc_size_of::{MallocSizeOfOps, MallocUnconditionalShallowSizeOf};
 use media_queries::Device;
 use parser::{Parse, ParserContext};
 use servo_arc::Arc;
 use shared_lock::{DeepCloneParams, DeepCloneWithLock, Locked, SharedRwLock, SharedRwLockReadGuard, ToCssWithGuard};
 use std::fmt;
 use style_traits::{ToCss, ParseError, StyleParseError};
-use stylesheets::{CssRules, MallocSizeOfFn, MallocSizeOfWithGuard};
+use stylesheets::CssRules;
 use values::specified::url::SpecifiedUrl;
 
 #[derive(Debug)]
@@ -29,10 +31,11 @@ pub struct DocumentRule {
 
 impl DocumentRule {
     /// Measure heap usage.
-    pub fn malloc_size_of_children(&self, guard: &SharedRwLockReadGuard,
-                                   malloc_size_of: MallocSizeOfFn) -> usize {
+    #[cfg(feature = "gecko")]
+    pub fn size_of(&self, guard: &SharedRwLockReadGuard, ops: &mut MallocSizeOfOps) -> usize {
         // Measurement of other fields may be added later.
-        self.rules.read_with(guard).malloc_size_of_children(guard, malloc_size_of)
+        self.rules.unconditional_shallow_size_of(ops) +
+            self.rules.read_with(guard).size_of(guard, ops)
     }
 }
 
@@ -135,7 +138,7 @@ impl UrlMatchingFunction {
     pub fn evaluate(&self, device: &Device) -> bool {
         use gecko_bindings::bindings::Gecko_DocumentRule_UseForPresentation;
         use gecko_bindings::structs::URLMatchingFunction as GeckoUrlMatchingFunction;
-        use nsstring::nsCString;
+        use nsstring::nsCStr;
 
         let func = match *self {
             UrlMatchingFunction::Url(_) => GeckoUrlMatchingFunction::eURL,
@@ -144,7 +147,7 @@ impl UrlMatchingFunction {
             UrlMatchingFunction::RegExp(_) => GeckoUrlMatchingFunction::eRegExp,
         };
 
-        let pattern = nsCString::from(match *self {
+        let pattern = nsCStr::from(match *self {
             UrlMatchingFunction::Url(ref url) => url.as_str(),
             UrlMatchingFunction::UrlPrefix(ref pat) |
             UrlMatchingFunction::Domain(ref pat) |

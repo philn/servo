@@ -1002,6 +1002,7 @@ impl<K, V, S> HashMap<K, V, S>
         self.try_entry(key).unwrap()
     }
 
+    #[inline(always)]
     pub fn try_entry(&mut self, key: K) -> Result<Entry<K, V>, FailedAllocationError> {
         // Gotta resize now.
         self.try_reserve(1)?;
@@ -1024,6 +1025,12 @@ impl<K, V, S> HashMap<K, V, S>
     /// ```
     pub fn len(&self) -> usize {
         self.table.size()
+    }
+
+    /// Access to the raw buffer backing this hashmap.
+    pub fn raw_buffer(&self) -> (*const (), usize) {
+        assert!(self.raw_capacity() != 0);
+        self.table.raw_buffer()
     }
 
     /// Returns true if the map contains no elements.

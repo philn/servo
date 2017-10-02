@@ -18,9 +18,9 @@ use gecko_bindings::sugar::ns_style_coord::{CoordDataValue, CoordData, CoordData
 use std::f32::consts::PI;
 use stylesheets::{Origin, RulesMutateError};
 use values::computed::{Angle, CalcLengthOrPercentage, Gradient, Image};
-use values::computed::{LengthOrPercentage, LengthOrPercentageOrAuto, Percentage};
+use values::computed::{Integer, LengthOrPercentage, LengthOrPercentageOrAuto, Percentage};
 use values::generics::box_::VerticalAlign;
-use values::generics::grid::TrackSize;
+use values::generics::grid::{TrackListValue, TrackSize};
 use values::generics::image::{CompatMode, Image as GenericImage, GradientItem};
 use values::generics::rect::Rect;
 use values::specified::url::SpecifiedUrl;
@@ -29,7 +29,7 @@ impl From<CalcLengthOrPercentage> for nsStyleCoord_CalcValue {
     fn from(other: CalcLengthOrPercentage) -> nsStyleCoord_CalcValue {
         let has_percentage = other.percentage.is_some();
         nsStyleCoord_CalcValue {
-            mLength: other.unclamped_length().0,
+            mLength: other.unclamped_length().to_i32_au(),
             mPercent: other.percentage.map_or(0., |p| p.0),
             mHasPercent: has_percentage,
         }
@@ -43,16 +43,16 @@ impl From<nsStyleCoord_CalcValue> for CalcLengthOrPercentage {
         } else {
             None
         };
-        Self::new(Au(other.mLength), percentage)
+        Self::new(Au(other.mLength).into(), percentage)
     }
 }
 
 impl From<LengthOrPercentage> for nsStyleCoord_CalcValue {
     fn from(other: LengthOrPercentage) -> nsStyleCoord_CalcValue {
         match other {
-            LengthOrPercentage::Length(au) => {
+            LengthOrPercentage::Length(px) => {
                 nsStyleCoord_CalcValue {
-                    mLength: au.0,
+                    mLength: px.to_i32_au(),
                     mPercent: 0.0,
                     mHasPercent: false,
                 }
@@ -73,9 +73,9 @@ impl LengthOrPercentageOrAuto {
     /// Convert this value in an appropriate `nsStyleCoord::CalcValue`.
     pub fn to_calc_value(&self) -> Option<nsStyleCoord_CalcValue> {
         match *self {
-            LengthOrPercentageOrAuto::Length(au) => {
+            LengthOrPercentageOrAuto::Length(px) => {
                 Some(nsStyleCoord_CalcValue {
-                    mLength: au.0,
+                    mLength: px.to_i32_au(),
                     mPercent: 0.0,
                     mHasPercent: false,
                 })
@@ -96,7 +96,7 @@ impl LengthOrPercentageOrAuto {
 impl From<nsStyleCoord_CalcValue> for LengthOrPercentage {
     fn from(other: nsStyleCoord_CalcValue) -> LengthOrPercentage {
         match (other.mHasPercent, other.mLength) {
-            (false, _) => LengthOrPercentage::Length(Au(other.mLength)),
+            (false, _) => LengthOrPercentage::Length(Au(other.mLength).into()),
             (true, 0) => LengthOrPercentage::Percentage(Percentage(other.mPercent)),
             _ => LengthOrPercentage::Calc(other.into()),
         }
@@ -106,7 +106,7 @@ impl From<nsStyleCoord_CalcValue> for LengthOrPercentage {
 impl From<nsStyleCoord_CalcValue> for LengthOrPercentageOrAuto {
     fn from(other: nsStyleCoord_CalcValue) -> LengthOrPercentageOrAuto {
         match (other.mHasPercent, other.mLength) {
-            (false, _) => LengthOrPercentageOrAuto::Length(Au(other.mLength)),
+            (false, _) => LengthOrPercentageOrAuto::Length(Au(other.mLength).into()),
             (true, 0) => LengthOrPercentageOrAuto::Percentage(Percentage(other.mPercent)),
             _ => LengthOrPercentageOrAuto::Calc(other.into()),
         }
@@ -328,8 +328,9 @@ impl nsStyleImage {
                 match shape {
                     EndingShape::Circle(Circle::Radius(length)) => {
                         unsafe {
-                            (*gecko_gradient).mRadiusX.set_value(CoordDataValue::Coord(length.0));
-                            (*gecko_gradient).mRadiusY.set_value(CoordDataValue::Coord(length.0));
+                            let au = length.to_i32_au();
+                            (*gecko_gradient).mRadiusX.set_value(CoordDataValue::Coord(au));
+                            (*gecko_gradient).mRadiusY.set_value(CoordDataValue::Coord(au));
                         }
                     },
                     EndingShape::Ellipse(Ellipse::Radii(x, y)) => {
@@ -616,13 +617,14 @@ pub mod basic_shape {
                 StyleShapeSourceType::Box => ShapeSource::Box(other.mReferenceBox.into()),
                 StyleShapeSourceType::URL => {
                     unsafe {
-                        let other_url = &(**other.__bindgen_anon_1.mURL.as_ref());
+                        let shape_image = &*other.mShapeImage.mPtr;
+                        let other_url = &(**shape_image.__bindgen_anon_1.mURLValue.as_ref());
                         let url = SpecifiedUrl::from_url_value_data(&other_url._base).unwrap();
                         ShapeSource::Url(url)
                     }
                 },
                 StyleShapeSourceType::Shape => {
-                    let other_shape = unsafe { &(**other.__bindgen_anon_1.mBasicShape.as_ref()) };
+                    let other_shape = unsafe { &*other.mBasicShape.mPtr };
                     let shape = other_shape.into();
                     let reference_box = if other.mReferenceBox == StyleGeometryBox::NoBox {
                         None
@@ -718,8 +720,8 @@ pub mod basic_shape {
         /// Set this `BorderRadius` into a given `nsStyleCoord`.
         pub fn set_corners(&self, other: &mut nsStyleCorners) {
             let mut set_corner = |field: &BorderCornerRadius, index| {
-                field.0.width.to_gecko_style_coord(&mut other.data_at_mut(index));
-                field.0.height.to_gecko_style_coord(&mut other.data_at_mut(index + 1));
+                field.0.width().to_gecko_style_coord(&mut other.data_at_mut(index));
+                field.0.height().to_gecko_style_coord(&mut other.data_at_mut(index + 1));
             };
             set_corner(&self.top_left, 0);
             set_corner(&self.top_right, 2);
@@ -892,6 +894,23 @@ impl TrackSize<LengthOrPercentage> {
                 min.to_gecko_style_coord(gecko_min);
                 max.to_gecko_style_coord(gecko_max);
             },
+        }
+    }
+}
+
+impl TrackListValue<LengthOrPercentage, Integer> {
+    /// Return TrackSize from given two nsStyleCoord
+    pub fn from_gecko_style_coords<T: CoordData>(gecko_min: &T, gecko_max: &T) -> Self {
+        TrackListValue::TrackSize(TrackSize::from_gecko_style_coords(gecko_min, gecko_max))
+    }
+
+    /// Save TrackSize to given gecko fields.
+    pub fn to_gecko_style_coords<T: CoordDataMut>(&self, gecko_min: &mut T, gecko_max: &mut T) {
+        use values::generics::grid::TrackListValue;
+
+        match *self {
+            TrackListValue::TrackSize(ref size) => size.to_gecko_style_coords(gecko_min, gecko_max),
+            _ => unreachable!("Should only transform from track-size computed values"),
         }
     }
 }

@@ -17,6 +17,7 @@ use element_state::ElementState;
 use font_metrics::FontMetricsProvider;
 use media_queries::Device;
 use properties::{AnimationRules, ComputedValues, PropertyDeclarationBlock};
+#[cfg(feature = "gecko")] use properties::LonghandId;
 #[cfg(feature = "gecko")] use properties::animated_properties::AnimationValue;
 #[cfg(feature = "gecko")] use properties::animated_properties::TransitionProperty;
 use rule_tree::CascadeLevel;
@@ -26,7 +27,6 @@ use selectors::matching::{ElementSelectorFlags, VisitedHandlingMode};
 use selectors::sink::Push;
 use servo_arc::{Arc, ArcBorrow};
 use shared_lock::Locked;
-use smallvec::VecLike;
 use std::fmt;
 #[cfg(feature = "gecko")] use hash::HashMap;
 use std::fmt::Debug;
@@ -34,8 +34,6 @@ use std::hash::Hash;
 use std::ops::Deref;
 use stylist::Stylist;
 use traversal_flags::{TraversalFlags, self};
-
-pub use style_traits::UnsafeNode;
 
 /// An opaque handle to a node, which, unlike UnsafeNode, cannot be transformed
 /// back into a non-opaque representation. The only safe operation that can be
@@ -104,12 +102,6 @@ pub trait TNode : Sized + Copy + Clone + Debug + NodeInfo {
     /// TODO(emilio): We should eventually replace this with the `impl Trait`
     /// syntax.
     type ConcreteChildrenIterator: Iterator<Item = Self>;
-
-    /// Convert this node in an `UnsafeNode`.
-    fn to_unsafe(&self) -> UnsafeNode;
-
-    /// Get a node back from an `UnsafeNode`.
-    unsafe fn from_unsafe(n: &UnsafeNode) -> Self;
 
     /// Get this node's parent node.
     fn parent_node(&self) -> Option<Self>;
@@ -436,7 +428,7 @@ pub trait TElement : Eq + PartialEq + Debug + Hash + Sized + Copy + Clone +
             // animation in a SequentialTask) is processed after the normal
             // traversal in that we had elements that handled snapshot.
             return data.has_styles() &&
-                   !data.restyle.hint.has_animation_hint_or_recascade();
+                   !data.hint.has_animation_hint_or_recascade();
         }
 
         if traversal_flags.contains(traversal_flags::UnstyledOnly) {
@@ -448,7 +440,7 @@ pub trait TElement : Eq + PartialEq + Debug + Hash + Sized + Copy + Clone +
             return false;
         }
 
-        data.has_styles() && !data.restyle.hint.has_non_animation_invalidations()
+        data.has_styles() && !data.hint.has_non_animation_invalidations()
     }
 
     /// Returns whether the element's styles are up-to-date after traversal
@@ -470,7 +462,7 @@ pub trait TElement : Eq + PartialEq + Debug + Hash + Sized + Copy + Clone +
         //
         // https://bugzilla.mozilla.org/show_bug.cgi?id=1389675 tracks fixing
         // this.
-        !data.restyle.hint.has_non_animation_invalidations()
+        !data.hint.has_non_animation_invalidations()
     }
 
     /// Flag that this element has a descendant for style processing.
@@ -620,7 +612,7 @@ pub trait TElement : Eq + PartialEq + Debug + Hash + Sized + Copy + Clone +
             Some(d) => d,
             None => return false,
         };
-        return data.restyle.hint.has_animation_hint()
+        return data.hint.has_animation_hint()
     }
 
     /// Returns the anonymous content for the current element's XBL binding,
@@ -656,24 +648,6 @@ pub trait TElement : Eq + PartialEq + Debug + Hash + Sized + Copy + Clone +
         false
     }
 
-    /// Gets declarations from XBL bindings from the element.
-    fn get_declarations_from_xbl_bindings<V>(
-        &self,
-        pseudo_element: Option<&PseudoElement>,
-        applicable_declarations: &mut V
-    ) -> bool
-    where
-        V: Push<ApplicableDeclarationBlock> + VecLike<ApplicableDeclarationBlock>
-    {
-        self.each_xbl_stylist(|stylist| {
-            stylist.push_applicable_declarations_as_xbl_only_stylist(
-                self,
-                pseudo_element,
-                applicable_declarations
-            );
-        })
-    }
-
     /// Gets the current existing CSS transitions, by |property, end value| pairs in a HashMap.
     #[cfg(feature = "gecko")]
     fn get_css_transitions_info(&self)
@@ -685,31 +659,33 @@ pub trait TElement : Eq + PartialEq + Debug + Hash + Sized + Copy + Clone +
     /// we can perform the more thoroughgoing check, needs_transitions_update, to further
     /// reduce the possibility of false positives.
     #[cfg(feature = "gecko")]
-    fn might_need_transitions_update(&self,
-                                     old_values: Option<&ComputedValues>,
-                                     new_values: &ComputedValues)
-                                     -> bool;
+    fn might_need_transitions_update(
+        &self,
+        old_values: Option<&ComputedValues>,
+        new_values: &ComputedValues
+    ) -> bool;
 
     /// Returns true if one of the transitions needs to be updated on this element. We check all
     /// the transition properties to make sure that updating transitions is necessary.
     /// This method should only be called if might_needs_transitions_update returns true when
     /// passed the same parameters.
     #[cfg(feature = "gecko")]
-    fn needs_transitions_update(&self,
-                                before_change_style: &ComputedValues,
-                                after_change_style: &ComputedValues)
-                                -> bool;
+    fn needs_transitions_update(
+        &self,
+        before_change_style: &ComputedValues,
+        after_change_style: &ComputedValues
+    ) -> bool;
 
     /// Returns true if we need to update transitions for the specified property on this element.
     #[cfg(feature = "gecko")]
-    fn needs_transitions_update_per_property(&self,
-                                             property: &TransitionProperty,
-                                             combined_duration: f32,
-                                             before_change_style: &ComputedValues,
-                                             after_change_style: &ComputedValues,
-                                             existing_transitions: &HashMap<TransitionProperty,
-                                                                            Arc<AnimationValue>>)
-                                             -> bool;
+    fn needs_transitions_update_per_property(
+        &self,
+        property: &LonghandId,
+        combined_duration: f32,
+        before_change_style: &ComputedValues,
+        after_change_style: &ComputedValues,
+        existing_transitions: &HashMap<TransitionProperty, Arc<AnimationValue>>
+    ) -> bool;
 
     /// Returns the value of the `xml:lang=""` attribute (or, if appropriate,
     /// the `lang=""` attribute) on this element.
@@ -720,10 +696,15 @@ pub trait TElement : Eq + PartialEq + Debug + Hash + Sized + Copy + Clone +
     /// of the `xml:lang=""` or `lang=""` attribute to use in place of
     /// looking at the element and its ancestors.  (This argument is used
     /// to implement matching of `:lang()` against snapshots.)
-    fn match_element_lang(&self,
-                          override_lang: Option<Option<AttrValue>>,
-                          value: &PseudoClassStringArg)
-                          -> bool;
+    fn match_element_lang(
+        &self,
+        override_lang: Option<Option<AttrValue>>,
+        value: &PseudoClassStringArg
+    ) -> bool;
+
+    /// Returns whether this element is the main body element of the HTML
+    /// document it is on.
+    fn is_html_document_body_element(&self) -> bool;
 }
 
 /// TNode and TElement aren't Send because we want to be careful and explicit

@@ -11,21 +11,22 @@ use cssparser::{CssStringWriter, Parser, RGBA, Token, BasicParseError};
 use euclid::ScaleFactor;
 use euclid::Size2D;
 use font_metrics::get_metrics_provider_for_product;
-use gecko::values::convert_nscolor_to_rgba;
+use gecko::values::{convert_nscolor_to_rgba, convert_rgba_to_nscolor};
 use gecko_bindings::bindings;
 use gecko_bindings::structs;
 use gecko_bindings::structs::{nsCSSKeyword, nsCSSProps_KTableEntry, nsCSSValue, nsCSSUnit};
 use gecko_bindings::structs::{nsMediaExpression_Range, nsMediaFeature};
 use gecko_bindings::structs::{nsMediaFeature_ValueType, nsMediaFeature_RangeType, nsMediaFeature_RequirementFlags};
 use gecko_bindings::structs::{nsPresContext, RawGeckoPresContextOwned};
-use gecko_bindings::structs::nsIAtom;
 use media_queries::MediaType;
 use parser::ParserContext;
 use properties::{ComputedValues, StyleBuilder};
 use properties::longhands::font_size;
+use rule_cache::RuleCacheConditions;
 use servo_arc::Arc;
+use std::cell::RefCell;
 use std::fmt::{self, Write};
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
 use str::starts_with_ignore_ascii_case;
 use string_cache::Atom;
 use style_traits::{CSSPixel, DevicePixel};
@@ -52,6 +53,11 @@ pub struct Device {
     /// the parent to compute everything else. So it is correct to just use
     /// a relaxed atomic here.
     root_font_size: AtomicIsize,
+    /// The body text color, stored as an `nscolor`, used for the "tables
+    /// inherit from body" quirk.
+    ///
+    /// https://quirks.spec.whatwg.org/#the-tables-inherit-color-from-body-quirk
+    body_text_color: AtomicUsize,
     /// Whether any styles computed in the document relied on the root font-size
     /// by using rem units.
     used_root_font_size: AtomicBool,
@@ -71,7 +77,8 @@ impl Device {
             pres_context: pres_context,
             default_values: ComputedValues::default_values(unsafe { &*pres_context }),
             // FIXME(bz): Seems dubious?
-            root_font_size: AtomicIsize::new(font_size::get_initial_value().value() as isize),
+            root_font_size: AtomicIsize::new(font_size::get_initial_value().size().0 as isize),
+            body_text_color: AtomicUsize::new(unsafe { &*pres_context }.mDefaultColor as usize),
             used_root_font_size: AtomicBool::new(false),
             used_viewport_size: AtomicBool::new(false),
         }
@@ -106,6 +113,18 @@ impl Device {
     /// Set the font size of the root element (for rem)
     pub fn set_root_font_size(&self, size: Au) {
         self.root_font_size.store(size.0 as isize, Ordering::Relaxed)
+    }
+
+    /// Sets the body text color for the "inherit color from body" quirk.
+    ///
+    /// https://quirks.spec.whatwg.org/#the-tables-inherit-color-from-body-quirk
+    pub fn set_body_text_color(&self, color: RGBA) {
+        self.body_text_color.store(convert_rgba_to_nscolor(&color) as usize, Ordering::Relaxed)
+    }
+
+    /// Returns the body text color.
+    pub fn body_text_color(&self) -> RGBA {
+        convert_nscolor_to_rgba(self.body_text_color.load(Ordering::Relaxed) as u32)
     }
 
     /// Gets the pres context associated with this document.
@@ -145,7 +164,7 @@ impl Device {
             // mMediaEmulated.
             let context = self.pres_context();
             let medium_to_use = if context.mIsEmulatingMedia() != 0 {
-                context.mMediaEmulated.raw::<nsIAtom>()
+                context.mMediaEmulated.mRawPtr
             } else {
                 context.mMedium
             };
@@ -675,11 +694,12 @@ impl Expression {
         self.evaluate_against(device, &value, quirks_mode)
     }
 
-    fn evaluate_against(&self,
-                        device: &Device,
-                        actual_value: &MediaExpressionValue,
-                        quirks_mode: QuirksMode)
-                        -> bool {
+    fn evaluate_against(
+        &self,
+        device: &Device,
+        actual_value: &MediaExpressionValue,
+        quirks_mode: QuirksMode,
+    ) -> bool {
         use self::MediaExpressionValue::*;
         use std::cmp::Ordering;
 
@@ -694,15 +714,17 @@ impl Expression {
 
         // http://dev.w3.org/csswg/mediaqueries3/#units
         // em units are relative to the initial font-size.
+        let mut conditions = RuleCacheConditions::default();
         let context = computed::Context {
             is_root_element: false,
             builder: StyleBuilder::for_derived_style(device, default_values, None, None),
             font_metrics_provider: &provider,
             cached_system_font: None,
             in_media_query: true,
-            // TODO: pass the correct value here.
-            quirks_mode: quirks_mode,
+            quirks_mode,
             for_smil_animation: false,
+            for_non_inherited_property: None,
+            rule_cache_conditions: RefCell::new(&mut conditions),
         };
 
         let required_value = match self.value {
@@ -713,7 +735,7 @@ impl Expression {
                 return match *actual_value {
                     BoolInteger(v) => v,
                     Integer(v) => v != 0,
-                    Length(ref l) => l.to_computed_value(&context) != Au(0),
+                    Length(ref l) => l.to_computed_value(&context).px() != 0.,
                     _ => true,
                 }
             }
@@ -722,14 +744,16 @@ impl Expression {
         // FIXME(emilio): Handle the possible floating point errors?
         let cmp = match (required_value, actual_value) {
             (&Length(ref one), &Length(ref other)) => {
-                one.to_computed_value(&context)
-                    .cmp(&other.to_computed_value(&context))
+                one.to_computed_value(&context).to_i32_au()
+                    .cmp(&other.to_computed_value(&context).to_i32_au())
             }
             (&Integer(one), &Integer(ref other)) => one.cmp(other),
             (&BoolInteger(one), &BoolInteger(ref other)) => one.cmp(other),
             (&Float(one), &Float(ref other)) => one.partial_cmp(other).unwrap(),
             (&IntRatio(one_num, one_den), &IntRatio(other_num, other_den)) => {
-                (one_num * other_den).partial_cmp(&(other_num * one_den)).unwrap()
+                // Extend to avoid overflow.
+                (one_num as u64 * other_den as u64).cmp(
+                    &(other_num as u64 * one_den as u64))
             }
             (&Resolution(ref one), &Resolution(ref other)) => {
                 let actual_dpi = unsafe {
