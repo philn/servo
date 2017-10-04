@@ -121,7 +121,7 @@ use timers::{IsInterval, TimerCallback};
 use tinyfiledialogs::{self, MessageBoxIcon};
 use url::Position;
 use webdriver_handlers::jsval_to_webdriver;
-use webrender_api::{ClipId, DocumentId};
+use webrender_api::{self, ClipId, DocumentId};
 use webvr_traits::WebVRMsg;
 
 /// Current state of the window object
@@ -290,6 +290,18 @@ pub struct Window {
     /// The Webrender Document id associated with this window.
     #[ignore_malloc_size_of = "defined in webrender_api"]
     webrender_document: DocumentId,
+
+    #[ignore_heap_size_of = "trait objects are hard"]
+    webrender_api_sender: webrender_api::RenderApiSender,
+}
+
+// FIXME Does not really belong here
+use dom::bindings::trace::JSTraceable;
+use js::jsapi::JSTracer;
+#[allow(unsafe_code)]
+unsafe impl JSTraceable for webrender_api::RenderApiSender {
+    unsafe fn trace(&self, _trc: *mut JSTracer) {
+    }
 }
 
 impl Window {
@@ -433,6 +445,10 @@ impl Window {
             ImageResponse::None => { nodes.remove(); }
         }
         self.add_pending_reflow();
+    }
+
+    pub fn get_webrender_api_sender(&self) -> webrender_api::RenderApiSender {
+        self.webrender_api_sender.clone()
     }
 }
 
@@ -1785,6 +1801,7 @@ impl Window {
         webvr_chan: Option<IpcSender<WebVRMsg>>,
         microtask_queue: Rc<MicrotaskQueue>,
         webrender_document: DocumentId,
+        webrender_api_sender: webrender_api::RenderApiSender,
     ) -> DomRoot<Self> {
         let layout_rpc: Box<LayoutRPC + Send> = {
             let (rpc_send, rpc_recv) = channel();
@@ -1860,6 +1877,7 @@ impl Window {
             test_worklet: Default::default(),
             paint_worklet: Default::default(),
             webrender_document,
+            webrender_api_sender: webrender_api_sender,
         });
 
         unsafe {

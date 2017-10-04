@@ -127,6 +127,7 @@ use url::percent_encoding::percent_decode;
 use webdriver_handlers;
 use webrender_api::DocumentId;
 use webvr_traits::{WebVREvent, WebVRMsg};
+use webrender_api;
 
 pub type ImageCacheMsg = (PipelineId, PendingImageResponse);
 
@@ -507,6 +508,9 @@ pub struct ScriptThread {
 
     /// The Webrender Document ID associated with this thread.
     webrender_document: DocumentId,
+
+    /// TODO
+    webrender_api_sender: webrender_api::RenderApiSender,
 }
 
 /// In the event of thread panic, all data on the stack runs its destructor. However, there
@@ -887,6 +891,7 @@ impl ScriptThread {
             custom_element_reaction_stack: CustomElementReactionStack::new(),
 
             webrender_document: state.webrender_document,
+            webrender_api_sender: state.webrender_api_sender,
         }
     }
 
@@ -2168,6 +2173,7 @@ impl ScriptThread {
             self.webvr_chan.clone(),
             self.microtask_queue.clone(),
             self.webrender_document,
+            self.webrender_api_sender.clone(),
         );
 
         // Initialize the browsing context for the window.
