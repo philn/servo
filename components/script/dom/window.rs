@@ -291,7 +291,7 @@ pub struct Window {
     #[ignore_malloc_size_of = "defined in webrender_api"]
     webrender_document: DocumentId,
 
-    #[ignore_heap_size_of = "trait objects are hard"]
+    #[ignore_malloc_size_of = "trait objects are hard"]
     webrender_api_sender: webrender_api::RenderApiSender,
 }
 
